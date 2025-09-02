@@ -1,33 +1,36 @@
 """
 vLLM Activation Capture System
 
-A fork extension of vLLM that enables real-time neural activation capture
-during inference without double computation.
+Hook-free activation capture designed to work with vLLM’s runner layer
+using an intermediate_tensors integration. Captures ALL tokens (prefill
+and decode) and supports fast, practical compression modes.
 
-Key Features:
-- Single-pass activation capture using PyTorch hooks
-- Selective layer capture with configurable compression
-- Zero-copy shared memory transfer for efficiency
-- Post-hoc marking of behaviorally interesting events
+Key Properties:
+- No PyTorch forward hooks (CUDA graphs can remain enabled)
+- All tokens captured via runner-level integration
+- Compression modes: random projection + uint8, full uint8, or top-k sparse
 
 Author: Research Team
-Date: August 2025
+Date: September 2025
 """
 
-from .gpu_model_runner_capture import (
-    GPUModelRunnerCapture,
-    SharedActivationBuffer,
+from .activations.capture import (
     ActivationCaptureConfig,
-    ActivationReader
+    ActMode,
+    ReturnMode,
+    ActivationCollector,
 )
 
-from .gpu_worker_capture import WorkerCapture
+__version__ = "1.1.0"
 
-__version__ = "1.0.0"
+# Note: vLLM-dependent runner/worker classes live under package paths
+#   vllm_capture.v1.worker.gpu_model_runner_correct
+#   vllm_capture.gpu_worker_capture
+# Import them directly from those modules when vLLM is available.
+
 __all__ = [
-    "GPUModelRunnerCapture",
-    "SharedActivationBuffer", 
     "ActivationCaptureConfig",
-    "ActivationReader",
-    "WorkerCapture"
+    "ActMode",
+    "ReturnMode",
+    "ActivationCollector",
 ]

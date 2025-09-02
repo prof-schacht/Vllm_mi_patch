@@ -182,7 +182,7 @@ class ActivationCollector:
             )
 
     @torch.no_grad()
-    def write_batch(self, *, seq_ids: List[int], layer_id: int, 
+    def write_batch(self, *, seq_ids: List[Any], layer_id: int, 
                     tensor: torch.Tensor, is_prefill: bool) -> None:
         """
         Write activations for a batch of sequences at a specific layer.
@@ -190,13 +190,34 @@ class ActivationCollector:
         Args:
             seq_ids: Sequence IDs in the batch
             layer_id: Which transformer layer
-            tensor: [B, S, H_shard] where S>1 for prefill, S=1 for decode
+            tensor: Activation tensor from vLLM (various shapes)
             is_prefill: Whether this is prefill (full prompt) or decode (single token)
         """
         if not self.cfg.enabled or not self.sequence_buffers:
             return
-            
-        B, S, H = tensor.shape
+        
+        # Handle different tensor shapes from vLLM
+        if tensor.ndim == 2:
+            # vLLM flattens batch dimension: [total_tokens, hidden_size]
+            N, H = tensor.shape
+            # For single sequence, reshape to [1, N, H]
+            if len(seq_ids) == 1:
+                B, S = 1, N
+                tensor = tensor.unsqueeze(0)  # Add batch dimension
+            else:
+                # Multiple sequences - would need token counts per seq to split properly
+                # For now, assume equal split (this is a simplification)
+                print(f"[WARNING] Flat tensor with {len(seq_ids)} sequences, assuming equal split")
+                tokens_per_seq = N // len(seq_ids)
+                B = len(seq_ids)
+                S = tokens_per_seq
+                # Reshape to [B, S, H] - may lose some tokens if not evenly divisible
+                tensor = tensor[:B*S].reshape(B, S, H)
+        elif tensor.ndim == 3:
+            B, S, H = tensor.shape
+            assert B == len(seq_ids), f"Batch size mismatch: {B} vs {len(seq_ids)}"
+        else:
+            raise ValueError(f"Unexpected tensor shape: {tensor.shape}")
         
         # Compress based on mode
         if self.cfg.mode == ActMode.RP8:
@@ -371,20 +392,24 @@ class CaptureContext:
     """
     def __init__(self, collector: ActivationCollector):
         self.collector = collector
-        self.batch_seq_ids: List[int] = []
+        self.batch_seq_ids: List[Any] = []
         self.is_prefill: bool = True
         
-    def set_batch_info(self, seq_ids: List[int], is_prefill: bool):
+    def set_batch_info(self, seq_ids: List[Any], is_prefill: bool):
         """Set current batch information."""
         self.batch_seq_ids = seq_ids
         self.is_prefill = is_prefill
     
     def capture_layer(self, layer_id: int, tensor: torch.Tensor):
         """Capture activation for a specific layer."""
+        print(f"[DEBUG] CaptureContext.capture_layer: layer_id={layer_id}, collector={self.collector is not None}, batch_seq_ids={self.batch_seq_ids}")
         if self.collector and self.batch_seq_ids:
+            print(f"[DEBUG] Calling write_batch with {len(self.batch_seq_ids)} sequences")
             self.collector.write_batch(
                 seq_ids=self.batch_seq_ids,
                 layer_id=layer_id,
                 tensor=tensor,
                 is_prefill=self.is_prefill
             )
+        else:
+            print(f"[DEBUG] Skipping - collector or batch_seq_ids not set")

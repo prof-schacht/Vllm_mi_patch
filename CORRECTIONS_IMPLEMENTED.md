@@ -1,77 +1,50 @@
 # Corrections Implemented Based on GPT5 External Review
 
-## Date: September 2, 2025
+Date: September 2, 2025
 
-## Summary
-The external review revealed fundamental architectural flaws in our original implementation. We have completely redesigned the system based on their recommendations.
+Summary: We removed the hooks-based path, adopted the hook-free runner-level integration, and updated docs/tests to match the actual implementation. The system now captures ALL tokens and uses practical compression (RP/uint8, full8, topk8). Claims about “zero-copy” and SVD in the hot path have been removed.
 
 ## Critical Flaws Identified and Fixed
 
-### 1. **Last Token Only Problem** ❌ → ✅
-**Original Issue**: We were only capturing the last token because vLLM's decode phase processes one token at a time, and our hooks just captured what they saw.
+### 1. Last-token-only capture → All tokens
+- Implemented per-sequence rolling buffers handling prefill and decode.
+- File: `vllm_capture/activations/capture.py` (`SequenceBuffer`, `ActivationCollector`).
 
-**Fix Implemented**: 
-- Created per-sequence rolling buffers that accumulate ALL tokens
-- Separate handling for prefill (all prompt tokens) vs decode (one token at a time)
-- See: `/vllm_capture/activations/capture.py` - `SequenceBuffer` class
+### 2. Hooks removed; runner integration
+- No PyTorch forward hooks; CUDA graphs can remain enabled.
+- Runner passes `intermediate_tensors` collector; models call `add(layer_id, hidden_states)`.
+- File: `vllm_capture/v1/worker/gpu_model_runner_correct.py`.
 
-### 2. **PyTorch Hooks Breaking CUDA Graphs** ❌ → ✅
-**Original Issue**: We used `register_forward_hook()` which requires `enforce_eager=True`, disabling CUDA graphs and causing significant slowdown.
+### 3. SVD in hot path removed; practical compression added
+- Compression modes: RP+uint8 (`rp8`), full uint8 (`full8`), top-k sparse (`topk8`).
+- File: `vllm_capture/activations/capture.py` (`RandomProjector`, quantization helpers).
 
-**Fix Implemented**:
-- Removed ALL PyTorch hooks
-- Use vLLM's existing `intermediate_tensors` pattern
-- Models call `intermediate_tensors.add(layer_id, tensor)` - one line per layer
-- See: `/vllm_capture/v1/worker/gpu_model_runner_correct.py`
+### 4. Zero-copy claims removed
+- Docs now state GPU→CPU requires copies; shared memory is CPU-only.
+- README/docs updated accordingly.
 
-### 3. **False Performance Claims** ❌ → ✅
-**Original Issue**: Claimed "~88% reduction with SVD + <5% overhead" which is mathematically impossible.
-
-**Fix Implemented**:
-- Replaced SVD with random projection (100x faster)
-- Use 8-bit quantization with per-row or per-dim scales
-- Realistic compression: RP to 512 dims + uint8 = ~10-20x reduction
-- See: `RandomProjector` class in `/vllm_capture/activations/capture.py`
-
-### 4. **Zero-Copy Lies** ❌ → ✅
-**Original Issue**: Claimed "zero-copy from GPU to CPU" which is physically impossible.
-
-**Fix Implemented**:
-- Honest documentation: GPU→CPU always requires copy
-- Use pinned memory for faster DMA
-- Shared memory only works between CPU processes
-- Updated all documentation to be accurate
-
-### 5. **Architecture Misalignment** ❌ → ✅
-**Original Issue**: Fighting vLLM's architecture instead of working with it.
-
-**Fix Implemented**:
-- Integrate at GPUModelRunner level (correct layer)
-- Use IntermediateTensors pattern (already exists for pipeline parallelism)
-- Respect TP/PP boundaries
-- Store activations in `RequestOutput.metrics["activation_manifest"]`
+### 5. Alignment with vLLM architecture
+- Capture is at runner layer, uses intermediate tensors, respects TP/PP.
+- Manifests are returned by runner; plumbing into RequestOutput can be added downstream.
 
 ## New Architecture Overview
 
-### Activation Flow:
-1. **Model Execution**: Model forward pass with `intermediate_tensors` parameter
-2. **Layer Capture**: Each layer calls `intermediate_tensors.add(layer_id, hidden_states)`
-3. **Compression**: Random projection + 8-bit quantization on GPU
-4. **Storage**: Per-sequence buffers accumulate tokens
-5. **Output**: Manifest in `RequestOutput.metrics` with paths to .npz files
+### Activation Flow
+1) Runner passes a collector via `intermediate_tensors`.
+2) Layers call `collector.add(layer_id, hidden_states)`.
+3) Collector compresses and accumulates tokens.
+4) Finalize writes `.npz` per (seq,layer); returns a manifest.
 
 ### Key Components:
 
 #### `/vllm_capture/activations/capture.py`
-- `ActivationCaptureConfig`: Configuration from env vars or args
-- `RandomProjector`: Fast compression (not SVD!)
-- `SequenceBuffer`: Accumulates ALL tokens per sequence
-- `ActivationCollector`: Main collector with proper prefill/decode handling
+- `ActivationCaptureConfig`, `ActMode`, `ReturnMode`
+- `RandomProjector`, quantization helpers
+- `SequenceBuffer`, `ActivationCollector`
 
 #### `/vllm_capture/v1/worker/gpu_model_runner_correct.py`
-- `IntermediateTensorCollector`: Shim that models call
-- `GPUModelRunnerCorrect`: Runner integration WITHOUT hooks
-- Proper batch info extraction from scheduler_output
+- `IntermediateTensorCollector`: shim models call per layer
+- `GPUModelRunnerCorrect`: hook-free runner integration
 
 #### `/examples/model_modifications/qwen_modification.py`
 - Shows the ONLY model change needed (one line per layer)

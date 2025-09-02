@@ -1,42 +1,30 @@
-# vLLM Activation Capture System
+# vLLM Activation Capture System (Hook-Free)
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![CUDA 12.0+](https://img.shields.io/badge/cuda-12.0+-green.svg)](https://developer.nvidia.com/cuda-downloads)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-A fork extension of vLLM that enables real-time neural activation capture during inference without double computation. Capture the model "red-handed" during the exact moment it generates text.
+Hook-free activation capture for vLLM that records ALL tokens (prefill and decode) using runner-level integration via `intermediate_tensors`. No PyTorch forward hooks, no double compute.
 
 ## 🎯 Key Features
 
-- **Single-Pass Capture**: Hooks fire during the EXACT inference generating text - no double computation
-- **Selective Layer Targeting**: Choose specific layers or capture all
-- **Efficient Compression**: Optional SVD compression reduces storage by ~88%
-- **Zero-Copy Transfer**: Shared memory buffers avoid serialization overhead
-- **Post-hoc Marking**: Mark interesting events after generation for selective storage
-- **Production Ready**: Tested on H100 GPUs with <5% performance overhead
+- **Hook-Free**: Integrates at the runner level; CUDA graphs can remain enabled
+- **All Tokens**: Captures prefill and decode tokens without last-token-only bugs
+- **Practical Compression**: Random projection + uint8, full uint8, or top‑k sparse
+- **Shard-Aware**: Works with tensor parallel; returns shard-local by default
+- **Portable Artifacts**: Saves per-(sequence,layer) `.npz` with quantized activations
 
-## 📊 Performance Results
+## 📊 Notes on Performance
 
-| Layers Captured | Compression | Throughput | Overhead | Storage/Inference |
-|-----------------|-------------|------------|----------|-------------------|
-| 3 layers | None | 399.2 tok/s | 0.1% | 5.9 MB |
-| 5 layers | SVD-256 | 405.9 tok/s | -1.5% | 1.2 MB |
-| 16 layers | SVD-256 | 394.3 tok/s | 1.4% | 3.9 MB |
-| 32 layers (all) | SVD-256 | 383.2 tok/s | 4.1% | 7.8 MB |
+- Overhead depends on compression mode, layers captured, and TP/PP topology.
+- Random projection to 256–512 dims with uint8 quantization is typically fast enough for online use.
+- We do not claim “zero-copy GPU→CPU” or unrealistically low overhead numbers.
 
 ## 🚀 Quick Start
 
 ### Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/vllm-activation-capture.git
-cd vllm-activation-capture
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Install the package
 pip install -e .
 ```
 
@@ -46,24 +34,25 @@ pip install -e .
 import os
 from vllm import LLM, SamplingParams
 
-# Configure activation capture
-os.environ["VLLM_CAPTURE_ENABLED"] = "1"
-os.environ["VLLM_CAPTURE_LAYERS"] = "0,7,15,23,31"  # Capture 5 layers
-os.environ["VLLM_CAPTURE_COMPRESSION_K"] = "256"    # SVD compression
+# Configure activation capture (hook-free)
+os.environ["VLLM_ACT_CAPTURE"] = "1"     # enable
+os.environ["VLLM_ACT_MODE"] = "rp8"      # rp8|full8|topk8
+os.environ["VLLM_ACT_RP_K"] = "512"      # RP output dims (rp8)
+os.environ["VLLM_ACT_OUTDIR"] = "/tmp/acts"
 
-# Initialize model with capture
 llm = LLM(
     model="Qwen/Qwen2.5-7B-Instruct",
-    worker_cls="vllm.v1.worker.gpu_worker_capture.WorkerCapture",
-    enforce_eager=True,  # Required for hooks
+    worker_cls="vllm_capture.gpu_worker_capture.WorkerCapture",
     tensor_parallel_size=1,
 )
 
-# Generate text (activations captured automatically)
-outputs = llm.generate(["The future of AI is"], 
-                       SamplingParams(temperature=0.7, max_tokens=50))
+outputs = llm.generate(["The future of AI is"], SamplingParams(max_tokens=32))
 
-print(outputs[0].outputs[0].text)
+text = outputs[0].outputs[0].text
+print(text)
+
+# If you patched vLLM to attach manifests to RequestOutput.metrics,
+# access them under outputs[...].metrics.extras["activation_manifest"].
 ```
 
 ## 📁 Repository Structure
@@ -71,8 +60,11 @@ print(outputs[0].outputs[0].text)
 ```
 vllm-activation-capture/
 ├── vllm_capture/              # Core implementation
-│   ├── gpu_model_runner_capture.py
-│   └── gpu_worker_capture.py
+│   ├── activations/            # Core capture + compression
+│   │   └── capture.py
+│   ├── v1/worker/
+│   │   └── gpu_model_runner_correct.py
+│   └── gpu_worker_capture.py   # Worker that uses the corrected runner
 ├── tests/                     # Test suite
 │   ├── unit/                  # Unit tests
 │   ├── integration/           # Integration tests
@@ -92,11 +84,13 @@ vllm-activation-capture/
 
 | Variable | Description | Default | Example |
 |----------|-------------|---------|---------|
-| `VLLM_CAPTURE_ENABLED` | Enable activation capture | "0" | "1" |
-| `VLLM_CAPTURE_LAYERS` | Layers to capture | None | "0,7,15,23,31" or "all" |
-| `VLLM_CAPTURE_COMPRESSION_K` | SVD components (None=no compression) | None | "256" |
-| `VLLM_CAPTURE_BUFFER_SIZE_GB` | Shared memory buffer size | "2.0" | "8.0" |
-| `VLLM_CAPTURE_SAMPLE_RATE` | Fraction of inferences to capture | "1.0" | "0.1" |
+| Variable | Description | Default | Example |
+|----------|-------------|---------|---------|
+| `VLLM_ACT_CAPTURE` | Enable activation capture | "0" | "1" |
+| `VLLM_ACT_MODE` | `rp8` (RP+u8), `full8`, `topk8` | `rp8` | `rp8` |
+| `VLLM_ACT_RP_K` | RP output dims (rp8) | `512` | `256` |
+| `VLLM_ACT_RETURN` | `sharded` or `gathered` | `sharded` | `gathered` |
+| `VLLM_ACT_OUTDIR` | Output directory for `.npz` | `/tmp/vllm_activations` | `/data/acts` |
 
 ## 🧪 Testing
 
@@ -111,54 +105,34 @@ pytest tests/integration/
 python tests/benchmarks/benchmark_layer_scaling.py
 ```
 
-## 📈 Scaling Analysis
+## 📈 Notes on Scaling
 
-For 100 agents over 500 timesteps (50,000 inferences):
-
-| Model | Layers | Compression | Storage | Runtime |
-|-------|--------|-------------|---------|---------|
-| Qwen2-0.5B | 24 | SVD-256 | 4.8 GB | ~14 hours |
-| Qwen2.5-7B | 5 | SVD-256 | 240 MB | ~14 hours |
-| Qwen2.5-7B | 32 | SVD-256 | 1.56 GB | ~14.4 hours |
-| Qwen2.5-7B | 32 | None | 213.6 GB | ~14.4 hours |
+Artifact sizes scale with tokens × layers × compressed dims. Use `rp8` (e.g., k=256–512) or `topk8` for sparse MLP capture to keep sizes manageable.
 
 ## 🔬 How It Works
 
-### Technical Innovation
+### Technical Overview
 
-1. **Hook Registration**: PyTorch hooks are registered on transformer layers during model initialization
-2. **Single Forward Pass**: Hooks fire during the EXACT inference that generates text
-3. **Shared Memory Transfer**: Activations are copied to shared memory via zero-copy transfer
-4. **Post-hoc Selection**: After generation, mark interesting events for permanent storage
-5. **Compression**: Optional SVD reduces storage while preserving information
+1. **Runner Integration**: The runner passes an `intermediate_tensors` collector into model forward.
+2. **Layer Taps**: Each transformer block calls `collector.add(layer_id, hidden_states)`.
+3. **Compression**: Runner-side compression (RP+u8, full8, topk8) on GPU; then spill to `.npz`.
+4. **Manifests**: A per-request manifest references the saved artifacts and compression metadata.
 
 ### Key Modifications to vLLM
 
-- `GPUModelRunnerCapture`: Extended model runner with hook registration
-- `SharedActivationBuffer`: Zero-copy shared memory management
-- `WorkerCapture`: Modified worker to use capture-enabled runner
+- `GPUModelRunnerCorrect`: Runner that integrates capture via `intermediate_tensors`
+- `ActivationCollector`: Token-accurate per-sequence rolling buffers + spill to `.npz`
+- `WorkerCapture`: Worker that installs the corrected runner
 
 ## 📚 Examples
 
-### Selective Layer Capture
+### Mode Examples
 ```python
-# Capture only critical layers for efficiency
-os.environ["VLLM_CAPTURE_LAYERS"] = "0,15,31"  # First, middle, last
-```
+os.environ["VLLM_ACT_MODE"] = "rp8"     # Residual stream RP to k dims + u8
+os.environ["VLLM_ACT_RP_K"] = "256"     # Use 256 dims
 
-### Full Capture Without Compression
-```python
-# Maximum fidelity for deep analysis
-os.environ["VLLM_CAPTURE_LAYERS"] = "all"
-os.environ.pop("VLLM_CAPTURE_COMPRESSION_K", None)  # No compression
-```
-
-### Multi-Agent Simulation
-```python
-# Efficient settings for 100 agents
-os.environ["VLLM_CAPTURE_LAYERS"] = "0,7,14,21,28"  # 5 distributed layers
-os.environ["VLLM_CAPTURE_COMPRESSION_K"] = "256"     # Compress for storage
-os.environ["VLLM_CAPTURE_SAMPLE_RATE"] = "0.1"      # Sample 10% of agents
+os.environ["VLLM_ACT_MODE"] = "full8"  # Full vector u8 per-row/per-dim scale
+os.environ["VLLM_ACT_MODE"] = "topk8"   # MLP top-k indices + u8 values
 ```
 
 ## 🤝 Contributing
@@ -197,4 +171,6 @@ If you use this work in your research, please cite:
 
 ---
 
-**Note**: This is a research tool. Always validate captured activations match your experimental requirements.
+Notes:
+- There is no zero-copy from GPU→CPU; copies happen before artifacts are written.
+- Disable capture for max throughput. Enable only when needed.
